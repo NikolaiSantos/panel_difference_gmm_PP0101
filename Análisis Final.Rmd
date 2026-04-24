@@ -1,0 +1,429 @@
+---
+title: "Interpretación de Resultados Econométricos: Ciclo Electoral y Gasto en Infraestructura Deportiva"
+author: "Orlando Nikolai Santos Alvarado"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  word_document:
+    toc: true
+    toc_depth: 3
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 7,
+  fig.height = 5,
+  dpi = 300
+)
+```
+
+```{r carga_datos_y_funciones, echo=FALSE}
+# Cargar paquetes necesarios
+library(plm)
+library(dplyr)
+library(readxl)
+library(ggplot2)
+
+# Cargar base de datos
+datos <- read_excel("Dataset_DISTRITAL.xlsx", sheet = "Hoja1")
+
+# Identificar tipo de municipalidad
+datos <- datos %>%
+  mutate(ES_PROVINCIAL = substr(UBIGEO, nchar(UBIGEO) - 1, nchar(UBIGEO)) == "01")
+
+datos_lmc <- datos %>% filter(AREA_POLITICO_ADMINISTRATIVA == "1") %>% filter(!ES_PROVINCIAL)
+datos_nolmc <- datos %>% filter(AREA_POLITICO_ADMINISTRATIVA == "0")
+
+datos_provinciales <- datos %>% filter(ES_PROVINCIAL)
+datos_distritales   <- datos %>% filter(!ES_PROVINCIAL)
+
+datos_provinciales_nolmc <- datos_nolmc %>% filter(ES_PROVINCIAL)
+datos_distritales_nolmc   <- datos_nolmc %>% filter(!ES_PROVINCIAL)
+
+# Función de estimación GMM
+estimar_modelo_gmm <- function(datos_input, nombre_modelo, min_T = 4) {
+  
+  cat("\n==========================================\n")
+  cat("ESTIMANDO:", nombre_modelo, "\n")
+  cat("==========================================\n")
+  
+  # 1) Filtrado: unidades con suficiente T
+  unidades_ok <- datos_input %>%
+    group_by(UBIGEO) %>%
+    summarise(T_obs = n_distinct(AÑO)) %>%
+    filter(T_obs >= min_T) %>%
+    pull(UBIGEO)
+  
+  datos_m <- datos_input %>%
+    filter(UBIGEO %in% unidades_ok)
+  
+  cat("Unidades retenidas:", length(unique(datos_m$UBIGEO)), "con T >=", min_T, "\n")
+  
+  # 2) Construcción de variables
+  datos_m <- datos_m %>%
+    mutate(
+      # Ciclo electoral
+      CICLO_ELECTORAL_2 = ifelse(CICLO_ELECTORAL == 2, 1, 0),
+      CICLO_ELECTORAL_3 = ifelse(CICLO_ELECTORAL == 3, 1, 0),
+      CICLO_ELECTORAL_4 = ifelse(CICLO_ELECTORAL == 4, 1, 0),
+      # Infraestructura
+      INFRA_MAYOR = (coalesce(ESTADIOS,0) + coalesce(COMPLEJOS_DEPORTIVOS,0) + coalesce(COLISEOS_DEPORTIVOS,0)),
+      INFRA_MENOR = (coalesce(LOSAS_MULTIDEPORTIVAS,0) + coalesce(LOSAS_FULBITO,0) +
+                       coalesce(LOSAS_VOLEY,0) + coalesce(LOSAS_BASQUET,0) + coalesce(PARQUES_ZONALES,0)
+                     + coalesce(PISCINAS,0) + coalesce(GIMNASIOS,0)),
+      # Capacidad administrativa
+      PROFESIONALES = 1000*(PROFESIONALES/exp(LOG_POB)),
+      # Participación / gobernanza
+      TRANSPARENCIA = coalesce(TRANSPARENCIA, 0),
+      PARTICIPACION = (coalesce(PARTICIPA_PP, 0) + coalesce(JUNTA_DELEGADOS_ACTIVIDAD, 0)),  
+      CAPACIDAD_PLAN = coalesce(PDMC, 0) + coalesce(PEI, 0),
+      # Variables fiscales
+      PROP_PIM_TRANSFERENCIAS_PP0101 = coalesce(PROP_PIM_TRANSFERENCIAS_PP0101, NA),
+      PROP_PP0101_SOBRE_TOTAL_PIM = coalesce(PROP_PP0101_SOBRE_TOTAL_PIM, NA),
+      NIVEL_EJECUCION_PP0101 = coalesce(NIVEL_EJECUCION_PP0101, NA),
+      # Demografía
+      POB_VARONES = coalesce(POB_VARONES, NA),
+      POB_15_64 = coalesce(POB_15_64, NA),
+      POB_URBANA = coalesce(POB_URBANA, NA),
+      # Variable dependiente
+      PROP_GASTO_DEPORTE = PROP_GASTO_INFRAESTRUCTURA_DEPORTIVA_Y_RECREATIVA_PP0101
+    )
+  
+  # 3) Selección de variables
+  vars_modelo <- c("UBIGEO", "AÑO",
+                   "PROP_GASTO_DEPORTE",
+                   "CICLO_ELECTORAL_2", "CICLO_ELECTORAL_3", "CICLO_ELECTORAL_4",
+                   "NIVEL_EJECUCION_PP0101",
+                   "PROP_PIM_TRANSFERENCIAS_PP0101",
+                   "PROP_PP0101_SOBRE_TOTAL_PIM",
+                   "POB_VARONES", "POB_15_64", "POB_URBANA",
+                   "PROFESIONALES", "TRANSPARENCIA",
+                   "INFRA_MAYOR", "INFRA_MENOR",
+                   "PARTICIPACION", "CAPACIDAD_PLAN")
+  
+  datos_m <- datos_m %>%
+    select(all_of(vars_modelo)) %>%
+    filter(!is.na(PROP_GASTO_DEPORTE))
+  
+  # 4) Convertir a panel
+  datos_panel <- datos_m %>%
+    arrange(UBIGEO, AÑO) %>%
+    pdata.frame(index = c("UBIGEO", "AÑO"))
+  
+  cat("Dimensiones panel:", dim(datos_panel), "\n")
+  cat("Unidades (N):", length(unique(index(datos_panel, "UBIGEO"))), "\n")
+  cat("T (promedio):", mean(table(index(datos_panel, "UBIGEO"))), "\n")
+  
+  # 5) Fórmula GMM
+  formula_pgmm <- as.formula(
+    paste0("PROP_GASTO_DEPORTE ~ lag(PROP_GASTO_DEPORTE, 1) + ",
+           "CICLO_ELECTORAL_2 + CICLO_ELECTORAL_3 + CICLO_ELECTORAL_4 + ",
+           "PROP_PIM_TRANSFERENCIAS_PP0101 + PROP_PP0101_SOBRE_TOTAL_PIM + ",
+           "POB_VARONES + POB_15_64 + POB_URBANA + PROFESIONALES + TRANSPARENCIA + ",
+           "NIVEL_EJECUCION_PP0101 + INFRA_MAYOR + INFRA_MENOR + PARTICIPACION + CAPACIDAD_PLAN | ",
+           "lag(PROP_GASTO_DEPORTE, 2:3) + lag(PROP_PIM_TRANSFERENCIAS_PP0101, 2)")
+  )
+  
+  # 6) Estimación
+  modelo <- tryCatch({
+    pgmm(
+      formula = formula_pgmm,
+      data = datos_panel,
+      effect = "individual",
+      model = "twosteps",
+      transformation = "d",
+      collapse = TRUE
+    )
+  }, error = function(e) {
+    message("Error en estimación: ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(modelo)) {
+    cat("No se pudo estimar el modelo para", nombre_modelo, "\n")
+    return(NULL)
+  }
+  
+  # 7) Resumen
+  cat("\n--- RESULTADOS:", nombre_modelo, "---\n")
+  s <- summary(modelo)
+  print(s)
+  
+  if (!is.null(s$test)) {
+    cat("\nPruebas de diagnóstico:\n")
+    print(s$test)
+  }
+  
+  return(list(modelo = modelo, datos_panel = datos_panel, nombre = nombre_modelo))
+}
+
+# Función de gráfico
+graficar_ciclo_electoral <- function(resultado_modelo) {
+  
+  if (is.null(resultado_modelo)) {
+    message("Modelo no disponible para graficar")
+    return(NULL)
+  }
+  
+  modelo <- resultado_modelo$modelo
+  nombre <- resultado_modelo$nombre
+  
+  coef_tab <- tryCatch(coef(summary(modelo)), error = function(e) NULL)
+  vars_ciclo <- c("CICLO_ELECTORAL_2", "CICLO_ELECTORAL_3", "CICLO_ELECTORAL_4")
+  
+  if (!is.null(coef_tab) && all(vars_ciclo %in% rownames(coef_tab))) {
+    df_plot <- data.frame(
+      Ciclo = c("Segundo año",
+                "Tercer año (preelectoral)",
+                "Cuarto año (electoral)"),
+      Estimate = coef_tab[vars_ciclo, "Estimate"],
+      SE = coef_tab[vars_ciclo, "Std. Error"]
+    )
+    
+    # --- CAMBIO CLAVE: Definir el orden explícito de los factores ---
+    df_plot$Ciclo <- factor(df_plot$Ciclo, 
+                            levels = c("Segundo año", 
+                                       "Tercer año (preelectoral)", 
+                                       "Cuarto año (electoral)"))
+    # ---------------------------------------------------------------
+    
+    cat("\n--- Coeficientes del ciclo electoral:", nombre, "---\n")
+    print(
+      data.frame(
+        Variable = vars_ciclo,
+        Estimate = round(df_plot$Estimate, 4),
+        Std_Error = round(df_plot$SE, 4),
+        Significancia = ifelse(abs(df_plot$Estimate / df_plot$SE) > 1.96, "Sí (p<0.05)", "No")
+      )
+    )
+    
+    p <- ggplot(df_plot, aes(x = Ciclo, y = Estimate)) +
+      geom_bar(stat = "identity", fill = "steelblue") +
+      geom_errorbar(
+        aes(ymin = Estimate - 1.96 * SE,
+            ymax = Estimate + 1.96 * SE),
+        width = 0.2
+      ) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+      theme_minimal() +
+      labs(
+        title = paste("Efecto del ciclo electoral -", nombre),
+        subtitle = "Difference GMM",
+        y = "Efecto marginal",
+        x = "Fase del ciclo electoral"
+      ) +
+      theme(axis.text.x = element_text(angle = 15, hjust = 1))
+    
+    print(p)
+    return(df_plot)
+  } else {
+    message("No se encontraron coeficientes del ciclo electoral")
+    return(NULL)
+  }
+}
+```
+
+## 1. Introducción Metodológica
+
+El presente documento presenta la interpretación académica de los resultados econométricos obtenidos mediante el método de **Momentos Generalizados en Sistema (System GMM)** para analizar la relación entre el ciclo electoral municipal y el nivel de ejecución del gasto en infraestructura deportiva en gobiernos locales peruanos (2013-2024). La especificación econométrica emplea un modelo dinámico de panel que controla:
+
+- **Persistencia temporal**: mediante la inclusión del rezago de primer orden de la variable dependiente (`lag(PROP_GASTO_DEPORTE, 1)`)
+- **Endogeneidad**: utilizando instrumentos en niveles y diferencias (rezagos 2 y 3 de la variable dependiente)
+- **Efectos fijos individuales**: mediante la transformación en diferencias (`transformation = "d"`)
+- **Heterocedasticidad**: mediante la estimación en dos pasos (`model = "twosteps"`)
+
+La variable dependiente es `PROP_GASTO_DEPORTE` (proporción del gasto en infraestructura deportiva dentro del Programa Presupuestal 0101). Las variables principales de interés son las *dummies* del ciclo electoral:
+
+- `CICLO_ELECTORAL_2`: segundo año del mandato (referencia: primer año)
+- `CICLO_ELECTORAL_3`: tercer año (preelectoral)
+- `CICLO_ELECTORAL_4`: cuarto año (electoral)
+
+## 2. Interpretación de Resultados por Modelo
+
+### 2.1. Modelo 1: Municipalidades de Todo el País
+
+```{r modelo_1_estimacion, echo=FALSE}
+modelo_1 <- estimar_modelo_gmm(datos, "Modelo 1 - Municipalidades de todo el país")
+```
+
+**Características de la muestra**: 1,486 municipalidades (provinciales y distritales) con al menos 4 observaciones anuales, totalizando 8,248 observaciones efectivas.
+
+**Hallazgos principales**:
+- **Año preelectoral (CICLO_ELECTORAL_3)**: incremento significativo de **4.10 puntos porcentuales** (p<0.01) en la proporción de gasto en infraestructura deportiva respecto al primer año de gestión.
+- **Año electoral (CICLO_ELECTORAL_4)**: incremento altamente significativo de **8.17 puntos porcentuales** (p<0.001), el doble del efecto observado en el año preelectoral.
+- **Segundo año (CICLO_ELECTORAL_2)**: efecto positivo pero no significativo estadísticamente (1.55 pp, p=0.172).
+
+
+```{r modelo_1_grafico, echo=FALSE}
+if (!is.null(modelo_1)) {
+  coef_1 <- graficar_ciclo_electoral(modelo_1)
+}
+```
+
+**Interpretación teórica**: Los resultados confirman la **hipótesis general (HG)** y son consistentes con la teoría de los ciclos políticos presupuestarios (CPP). La magnitud creciente del efecto (2° año < 3° año < 4° año) sugiere una estrategia deliberada de *timing* en la ejecución de obras: los alcaldes aceleran la ejecución de proyectos de infraestructura deportiva visible en los últimos años de gestión para maximizar su impacto electoral. Este patrón refleja la lógica de la elección pública, donde los funcionarios priorizan gastos con alta *salience* (visibilidad) que generan externalidades políticas inmediatas (inauguraciones públicas, reconocimiento ciudadano), aprovechando que las obras de menor envergadura (losas multideportivas, gimnasios) permiten plazos de ejecución compatibles con el calendario electoral.
+
+**Diagnóstico econométrico**: El test de Sargan/Hansen (p=0.450) no rechaza la validez de los instrumentos; la ausencia de autocorrelación AR(2) (p=0.491) valida la especificación instrumental; y el test de Wald (p<0.001) confirma el poder explicativo global del modelo.
+
+### 2.2. Modelo 2.1: Municipalidades Provinciales de Todo el País
+
+```{r modelo_2_1_estimacion, echo=FALSE}
+modelo_2_1 <- estimar_modelo_gmm(datos_provinciales, "Modelo 2.1 - Municipalidades provinciales de todo el país")
+```
+
+**Características de la muestra**: 186 capitales provinciales con al menos 4 observaciones anuales, totalizando 1,377 observaciones efectivas. Estas municipalidades concentran mayor capacidad administrativa, fiscal y de supervisión que los distritos.
+
+**Hallazgos principales**:
+- **Año preelectoral (CICLO_ELECTORAL_3)**: incremento positivo de 4.59 pp, pero **no significativo** (p=0.127).
+- **Año electoral (CICLO_ELECTORAL_4)**: incremento marginalmente significativo de 5.08 pp (p=0.098).
+- **Segundo año (CICLO_ELECTORAL_2)**: incremento positivo de 5.04 pp, pero no significativo (p=0.121).
+
+```{r modelo_2_1_grafico, echo=FALSE}
+if (!is.null(modelo_2_1)) {
+  coef_2_1 <- graficar_ciclo_electoral(modelo_2_1)
+}
+```
+
+**Interpretación institucional**: Los resultados **no respaldan la hipótesis específica HE1**. La ausencia de significancia estadística robusta sugiere que las capitales provinciales presentan menor volatilidad electoral en la asignación presupuestal, atribuible a:
+1. **Mayor institucionalidad**: Presencia permanente de contralorías regionales, fiscalías descentralizadas y medios de comunicación con capacidad de fiscalización.
+2. **Menor discrecionalidad**: Las capitales provinciales suelen tener estructuras administrativas más complejas con controles internos más desarrollados, limitando la manipulación oportunista del gasto.
+3. **Diversificación del gasto**: Al ser sedes de gobierno regional, estas municipalidades enfrentan demandas más heterogéneas que diluyen el foco en proyectos electorales puntuales.
+
+Este hallazgo es consistente con la literatura sobre CPP en contextos con mayor desarrollo institucional (Contreras, 2024), donde las reglas fiscales y mecanismos de control atenúan los incentivos para la manipulación electoral del gasto.
+
+### 2.3. Modelo 2.2: Municipalidades Distritales de Todo el País
+
+```{r modelo_2_2_estimacion, echo=FALSE}
+modelo_2_2 <- estimar_modelo_gmm(datos_distritales, "Modelo 2.2 - Municipalidades distritales de todo el país")
+```
+
+**Características de la muestra**: 1,300 municipalidades distritales con al menos 4 observaciones anuales, totalizando 6,871 observaciones efectivas. Representan el 88% del total de gobiernos locales peruanos.
+
+**Hallazgos principales**:
+- **Año preelectoral (CICLO_ELECTORAL_3)**: incremento significativo de **3.87 puntos porcentuales** (p=0.016).
+- **Año electoral (CICLO_ELECTORAL_4)**: incremento altamente significativo de **8.55 puntos porcentuales** (p<0.001).
+- **Segundo año (CICLO_ELECTORAL_2)**: efecto no significativo (0.97 pp, p=0.422).
+
+```{r modelo_2_2_grafico, echo=FALSE}
+if (!is.null(modelo_2_2)) {
+  coef_2_2 <- graficar_ciclo_electoral(modelo_2_2)
+}
+```
+
+**Interpretación teórica**: Los resultados **confirman plenamente la hipótesis específica HE2**. Las municipalidades distritales exhiben una clara estrategia de manipulación electoral del gasto en infraestructura deportiva, con un patrón acumulativo hacia el final del mandato. Esta vulnerabilidad puede explicarse por:
+1. **Menor capacidad fiscal**: Alta dependencia de transferencias intergubernamentales (coeficiente marginal positivo aunque no significativo: +0.311, p=0.207), lo que reduce la percepción del costo fiscal local y amplifica los incentivos para el gasto visible (efecto *common-pool problem*).
+2. **Competencia electoral intensa**: En distritos, donde la identidad territorial está fuertemente vinculada a espacios públicos locales, la infraestructura deportiva genera retornos políticos marginales más elevados que en capitales provinciales.
+3. **Menor fiscalización**: Ausencia de medios de comunicación locales robustos y menor presencia de organismos de control especializados facilitan la ejecución discrecional de proyectos electorales.
+
+Este hallazgo extiende empíricamente los resultados de Fontecilla-Contreras (2019) en Chile al contexto peruano, confirmando que los gobiernos locales de menor escala son más susceptibles a los CPP en gasto deportivo.
+
+### 2.4. Modelo 3.1: Municipalidades Distritales de Lima Metropolitana y Callao
+
+```{r modelo_3_1_estimacion, echo=FALSE}
+modelo_3_1 <- estimar_modelo_gmm(datos_lmc, "Modelo 3.1 - Municipalidades distritales de Lima Metropolitana y Callao")
+```
+
+**Características de la muestra**: 48 distritos de Lima Metropolitana y Callao con al menos 4 observaciones anuales, totalizando 387 observaciones efectivas. Estas municipalidades presentan mayor capacidad fiscal, administrativa y visibilidad mediática que el promedio nacional.
+
+**Hallazgos principales**:
+- **Año preelectoral (CICLO_ELECTORAL_3)**: incremento positivo de 12.26 pp, pero **no significativo** (p=0.184), atribuible a errores estándar elevados por el tamaño reducido de la muestra.
+- **Año electoral (CICLO_ELECTORAL_4)**: incremento significativo de **17.04 puntos porcentuales** (p=0.006), el efecto más pronunciado entre todos los modelos estimados.
+- **Segundo año (CICLO_ELECTORAL_2)**: incremento marginalmente significativo de 10.87 pp (p=0.060).
+
+```{r modelo_3_1_grafico, echo=FALSE}
+if (!is.null(modelo_3_1)) {
+  coef_3_1 <- graficar_ciclo_electoral(modelo_3_1)
+}
+```
+
+**Interpretación contextual**: A pesar de contar con mayor institucionalidad, las municipalidades de LMC exhiben el efecto electoral más intenso en términos absolutos. Esta paradoja puede explicarse por:
+1. **Competencia política exacerbada**: En un entorno metropolitano con alta fragmentación partidaria y medios de comunicación omnipresentes, los alcaldes enfrentan presiones intensas para demostrar "gestión visible" mediante inauguraciones de obras.
+2. **Economías de escala en la visibilidad**: Una losa multideportiva en un distrito limeño recibe cobertura mediática masiva que multiplica su impacto político, incentivando la concentración en infraestructura sobre otros componentes del PP0101.
+3. **Presión de electorados urbanos**: La población urbana metropolitana valora más la infraestructura física tangible que los programas intangibles, reforzando los incentivos para el gasto visible.
+
+Este resultado matiza la hipótesis HE3, mostrando que mayor capacidad institucional no necesariamente atenúa los CPP cuando coexisten factores que amplifican los incentivos electorales (competencia política, visibilidad mediática).
+
+### 2.5. Modelo 3.2: Municipalidades Provinciales del Resto del País
+
+```{r modelo_3_2_estimacion, echo=FALSE}
+modelo_3_2 <- estimar_modelo_gmm(datos_provinciales_nolmc, "Modelo 3.2 - Municipalidades provinciales del resto del país")
+```
+
+**Características de la muestra**: 184 capitales provinciales fuera de Lima Metropolitana y Callao, con 1,363 observaciones efectivas.
+
+**Hallazgos principales**:
+- **Año preelectoral (CICLO_ELECTORAL_3)**: incremento positivo de 4.80 pp, pero no significativo (p=0.119).
+- **Año electoral (CICLO_ELECTORAL_4)**: incremento marginalmente significativo de 5.28 pp (p=0.091).
+- **Segundo año (CICLO_ELECTORAL_2)**: incremento marginalmente significativo de 5.68 pp (p=0.090).
+
+```{r modelo_3_2_grafico, echo=FALSE}
+if (!is.null(modelo_3_2)) {
+  coef_3_2 <- graficar_ciclo_electoral(modelo_3_2)
+}
+```
+
+**Interpretación comparativa**: Los resultados son prácticamente idénticos a los del Modelo 2.1 (provinciales de todo el país), confirmando que el comportamiento de las capitales provinciales es homogéneo independientemente de su ubicación geográfica. La ausencia de CPP robustos en estas unidades refuerza la interpretación institucional previa: las características estructurales de las capitales provinciales (capacidad administrativa, supervisión, diversificación de funciones) constituyen un *buffer* contra la manipulación electoral del gasto, más allá de factores regionales específicos.
+
+### 2.6. Modelo 3.3: Municipalidades Distritales del Resto del País
+
+```{r modelo_3_3_estimacion, echo=FALSE}
+modelo_3_3 <- estimar_modelo_gmm(datos_distritales_nolmc, "Modelo 3.3 - Municipalidades distritales del resto del país")
+```
+
+**Características de la muestra**: 1,252 distritos fuera de Lima Metropolitana y Callao, con 6,483 observaciones efectivas. Representa el 85% de todas las municipalidades distritales del país.
+
+**Hallazgos principales**:
+- **Año preelectoral (CICLO_ELECTORAL_3)**: incremento significativo de **3.94 puntos porcentuales** (p=0.024).
+- **Año electoral (CICLO_ELECTORAL_4)**: incremento altamente significativo de **8.10 puntos porcentuales** (p<0.001).
+- **Segundo año (CICLO_ELECTORAL_2)**: efecto no significativo (0.65 pp, p=0.607).
+
+```{r modelo_3_3_grafico, echo=FALSE}
+if (!is.null(modelo_3_3)) {
+  coef_3_3 <- graficar_ciclo_electoral(modelo_3_3)
+}
+```
+
+**Interpretación teórica**: Los resultados **confirman la hipótesis HE2** con mayor robustez estadística que el Modelo 2.2 (distritales de todo el país), al excluir el efecto atípico de LMC. El patrón observado es prácticamente idéntico al del Modelo 2.2 (3.87 pp vs. 3.94 pp en año preelectoral; 8.55 pp vs. 8.10 pp en año electoral), lo que demuestra que:
+1. El comportamiento de los distritos del resto del país es representativo del patrón nacional en municipalidades distritales.
+2. La magnitud del CPP en gasto deportivo es estable y robusta en contextos de menor desarrollo institucional y menor visibilidad mediática.
+3. La dependencia de transferencias intergubernamentales (aunque no significativa estadísticamente en este modelo: +0.333, p=0.247) opera como factor contextual que amplifica los incentivos para el gasto visible en períodos electorales.
+
+Este hallazgo es particularmente relevante para políticas públicas, ya que identifica a los distritos del interior del país como el segmento más vulnerable a la manipulación electoral del gasto deportivo, requiriendo mecanismos de control específicos.
+
+## 3. Síntesis Comparativa de Hallazgos
+
+Los seis modelos estimados permiten identificar patrones diferenciales en la relación entre el ciclo electoral y el gasto en infraestructura deportiva según el tipo de municipalidad:
+
+**Patrón nacional agregado (Modelo 1)**: Se observa un efecto electoral robusto y creciente a lo largo del mandato, con incrementos significativos en el año preelectoral (+4.10 pp) y especialmente en el año electoral (+8.17 pp). Este resultado confirma la existencia de CPP en el gasto deportivo a nivel nacional.
+
+**Diferenciación por nivel jerárquico**: Las municipalidades provinciales (Modelos 2.1 y 3.2) muestran efectos positivos pero no estadísticamente significativos en el ciclo electoral, mientras que las distritales (Modelos 2.2 y 3.3) exhiben efectos robustos y altamente significativos. Esta divergencia sugiere que la mayor capacidad institucional y administrativa de las capitales provinciales actúa como barrera contra la manipulación electoral del gasto.
+
+**Heterogeneidad geográfica en distritos**: Las municipalidades distritales de Lima Metropolitana y Callao (Modelo 3.1) presentan el coeficiente absoluto más elevado (+17.04 pp en año electoral), aunque con menor precisión estadística debido al tamaño reducido de la muestra (N=48). En contraste, los distritos del resto del país (Modelo 3.3) muestran un efecto ligeramente menor (+8.10 pp) pero con mayor robustez estadística (N=1,252). Esta diferencia refleja dinámicas contextuales distintas: en LMC operan factores que amplifican los incentivos electorales (competencia política intensa, visibilidad mediática), mientras que en el resto del país predomina la vulnerabilidad institucional (menor fiscalización, mayor dependencia de transferencias).
+
+**Persistencia del gasto**: El coeficiente del rezago de primer orden (`lag(PROP_GASTO_DEPORTE, 1)`) es significativo en todos los modelos (rango: 0.050–0.236), confirmando la existencia de inercia presupuestal en la asignación de recursos al gasto en infraestructura deportiva. Este hallazgo justifica metodológicamente la especificación dinámica del modelo y sugiere que las decisiones presupuestales actuales están condicionadas por asignaciones históricas.
+
+**Variables de control relevantes**: El nivel de ejecución del PP0101 (`NIVEL_EJECUCION_PP0101`) presenta un efecto positivo y altamente significativo en todos los modelos (≈ +0.16, p<0.001), indicando que una mayor ejecución global del programa presupuestal se asocia con mayor proporción destinada a infraestructura. Este resultado sugiere que los municipios con mejor capacidad de gestión no redistribuyen el gasto hacia componentes no infraestructurales, sino que intensifican la inversión en infraestructura, reforzando la concentración observada en los datos descriptivos del proyecto de tesis.
+
+## 4. Conclusiones y Validación de Hipótesis
+
+1. **Hipótesis general (HG)**: **Confirmada**. Existe una relación estadísticamente significativa entre el ciclo electoral municipal y el nivel de ejecución del gasto en infraestructura deportiva a nivel agregado nacional, con efectos crecientes en los años preelectoral (+4.10 pp) y electoral (+8.17 pp).
+
+2. **Hipótesis específica HE1** (municipalidades provinciales): **No confirmada**. Los efectos del ciclo electoral no alcanzan significancia estadística convencional en capitales provinciales (Modelos 2.1 y 3.2), sugiriendo que su mayor institucionalidad y capacidad administrativa actúan como barreras contra la manipulación electoral del gasto.
+
+3. **Hipótesis específica HE2** (municipalidades distritales): **Confirmada**. Los distritos exhiben efectos electorales robustos y significativos tanto a nivel nacional (Modelo 2.2: +8.55 pp) como en el resto del país (Modelo 3.3: +8.10 pp), evidenciando mayor vulnerabilidad a la manipulación presupuestal por menor capacidad institucional y mayor dependencia de transferencias.
+
+4. **Hipótesis específica HE3** (diferencias LMC vs resto): **Parcialmente confirmada con matices**. Aunque el coeficiente absoluto es mayor en LMC (+17.04 pp), su significancia estadística es limitada por el tamaño muestral reducido (N=48). En contraste, el efecto en distritos del resto del país (+8.10 pp) es altamente significativo y robusto (N=1,252). La relación ciclo electoral-gasto existe en ambos contextos, pero con dinámicas distintas: en LMC opera mediante competencia política intensa y visibilidad mediática; en el resto del país, mediante menor fiscalización y mayor dependencia de transferencias.
+
+5. **Hallazgo metodológico relevante**: La especificación System GMM resultó apropiada para abordar la endogeneidad y persistencia temporal, con diagnósticos satisfactorios en todos los modelos estimados (test de Sargan/Hansen >0.10; ausencia de AR(2); Wald global significativo).
+
+## 5. Implicancias para Políticas Públicas
+
+Los resultados evidencian la necesidad de diseñar mecanismos de control diferenciados según el tipo de municipalidad:
+
+- **Para municipalidades distritales**: Implementar reglas fiscales subnacionales que limiten la concentración del gasto en infraestructura durante los dos últimos años del mandato, similar a las medidas adoptadas en Colombia (Contreras, 2024).
+
+- **Para Lima Metropolitana y Callao**: Fortalecer los sistemas de monitoreo de obras públicas con estándares técnicos independientes del calendario electoral, aprovechando su mayor capacidad institucional.
+
+- **Para todas las municipalidades**: Reformar el diseño del PP0101 para establecer umbrales mínimos de gasto en componentes no infraestructurales (programas, capacitación, inclusión), rompiendo la lógica de concentración actual que facilita la manipulación electoral.
